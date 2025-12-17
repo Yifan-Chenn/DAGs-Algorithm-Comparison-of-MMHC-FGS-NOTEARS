@@ -1,0 +1,55 @@
+#define fgs function
+import os
+import time
+import pandas as pd
+import numpy as np
+import jpype
+from jpype import startJVM, isJVMStarted, shutdownJVM, JClass
+from pytetrad.tools import translate as tr
+
+#path defining (for JAVA environment)
+project_dir = r"C:\Users\yuyao\STAT250"
+tetrad_folder = os.path.join(project_dir, "tetrad")
+
+tetrad_gui_jar = os.path.join(tetrad_folder, "tetrad-gui-7.6.9-launch.jar")
+tetrad_lib_jar = os.path.join(tetrad_folder, "tetrad-lib-7.6.9-shaded.jar")
+
+classpath = f"{tetrad_gui_jar}{os.pathsep}{tetrad_lib_jar}"
+
+jvm_path = r"C:\Program Files\Eclipse Adoptium\jdk-21.0.9.10-hotspot\bin\server\jvm.dll"
+
+#start JAVA
+if not isJVMStarted():
+    startJVM(jvm_path, "-ea", f"-Djava.class.path={classpath}")
+
+Fges = JClass("edu.cmu.tetrad.search.Fges")
+SemBicScore = JClass("edu.cmu.tetrad.search.score.SemBicScore")
+
+
+#define fgs function
+def run_fges_safe(df: pd.DataFrame, penalty_discount=2.0, max_degree=5):
+    from pytetrad.tools import translate as tr
+
+    if isinstance(df, np.ndarray):
+        df = pd.DataFrame(df, columns=[f"V{i}" for i in range(df.shape[1])])
+
+    df = df.select_dtypes(include=[np.number]).fillna(0)
+    assert len(df.columns) == len(set(df.columns)), "Have repetitions!"
+
+    # transform to BoxDataSet
+    box_data = tr.pandas_data_to_tetrad(df)
+
+    # build score
+    score = SemBicScore(box_data, penalty_discount, True)
+
+    # build fgs
+    fges = Fges(score)
+
+    # parent max-degree
+    fges.setMaxDegree(max_degree)
+
+    graph = fges.search()
+
+    return graph
+
+# shutdownJVM()
