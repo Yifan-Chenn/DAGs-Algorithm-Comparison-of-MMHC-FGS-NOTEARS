@@ -1,0 +1,278 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+import sklearn
+import torch
+import time
+
+from notears.linear import notears_linear
+
+
+rng = np.random.default_rng()
+
+# Generate Random Graph
+def generate_dag(
+    d,
+    k=2,                # sparsity level, choose 1 or 2
+    model='ba',         # 'er' (Erdős–Rényi) or 'ba' (scale-free)
+    weight_regime='strong',  # 'strong', 'weak'
+    seed=None
+):
+
+
+    local_rng = np.random.default_rng(seed)
+
+    #determine number of edges
+    if model == 'er':
+        s0 = int(k * d)
+        if d > 1:
+            p = min(1.0, 2.0 * s0 / (d * (d - 1)))
+        else:
+            p = 0.0
+        G_und = nx.gnp_random_graph(d, p, seed=local_rng)  # undirected
+
+    elif model == 'ba':
+        m = max(1, int(round(k)))
+        G_und = nx.barabasi_albert_graph(d, m, seed=local_rng)
+
+    else:
+        raise ValueError("Invalid model type: use 'er' or 'ba'.")
+
+    #determine the direction
+    G = nx.DiGraph()
+    G.add_nodes_from(G_und.nodes())
+    for u, v in G_und.edges():
+        if u < v:
+            G.add_edge(u, v)
+        else:
+            G.add_edge(v, u)
+
+    assert nx.is_directed_acyclic_graph(G), "Generated graph has cycles!"
+
+    #0,1 adjacency
+    A = nx.to_numpy_array(G)
+
+    #determine edge weights
+    if weight_regime == 'strong':
+        w_min, w_max = 0.5, 2.0
+    elif weight_regime == 'weak':
+        w_min, w_max = 0.3, 0.5
+    else:
+        raise ValueError("Invalid weight_regime: use 'strong', or 'weak'.")
+
+    #apply absolute value and randomly assign the sign
+    abs_weights = local_rng.uniform(w_min, w_max, size=A.shape)
+    signs = local_rng.choice([-1.0, 1.0], size=A.shape)
+    weights = abs_weights * signs
+
+    W = A * weights
+
+    return W, A
+
+#generate data from linear SEM
+def simulate_sem(W, n, noise_scale=1.0, sem_type='gauss', seed=None):
+
+    local_rng = np.random.default_rng(seed)
+    d = W.shape[0]
+    X = np.zeros((n, d))
+
+    A = (np.abs(W) > 0).astype(int)
+    G = nx.from_numpy_array(A, create_using=nx.DiGraph)
+    assert nx.is_directed_acyclic_graph(G), "W must define a DAG!"
+    topo_order = list(nx.topological_sort(G))
+
+    #generate noise
+    for k in range(n):
+        if sem_type == 'gauss':
+            eps = noise_scale * local_rng.standard_normal(d)
+        else:
+            raise NotImplementedError("Only 'gauss' sem_type implemented for now.")
+
+        #generate each variable according to topological order
+        x = np.zeros(d)
+        for j in topo_order:
+            # X_j = sum_i W_ij * X_i + eps_j
+            x[j] = np.dot(x, W[:, j]) + eps[j]
+        X[k, :] = x
+
+    return X
+
+#complete dataset generation
+def generate_simulation_dataset(
+    d=20,
+    n_factor=5,          # n = n_factor * d
+    k=2,                 # 1 or 2
+    model='ba',          # 'er' or 'ba'
+    weight_regime='strong',
+    noise_scale=1.0,
+    sem_type='gauss',
+    seed=None
+):
+
+    n = int(n_factor * d)
+    W_true, A_true = generate_dag(
+        d=d,
+        k=k,
+        model=model,
+        weight_regime=weight_regime,
+        seed=seed
+    )
+    X = simulate_sem(
+        W_true,
+        n=n,
+        noise_scale=noise_scale,
+        sem_type=sem_type,
+        seed=None if seed is None else seed + 1
+    )
+    return W_true, A_true, X
+
+import numpy as np
+#obtain evaluation metrics
+def evaluate_graph(
+    A_true,
+    A_est,
+    runtime=None,
+    count_reversed_as_two=False,
+):
+
+    A_true = np.asarray(A_true).astype(int)
+    A_est  = np.asarray(A_est).astype(int)
+
+    assert A_true.shape == A_est.shape, "Shapes of A_true and A_est must match."
+    d = A_true.shape[0]
+
+    A_true = A_true.copy()
+    A_est  = A_est.copy()
+    np.fill_diagonal(A_true, 0)
+    np.fill_diagonal(A_est, 0)
+
+    # true/false edges
+    true_edges = (A_true == 1)
+    est_edges  = (A_est  == 1)
+
+    TP = np.sum(true_edges & est_edges)               # correctly recovered directed edges
+    FP = np.sum(~true_edges & est_edges)              # predicted but not true
+    FN = np.sum(true_edges & ~est_edges)              # missed true edges
+
+    n_true = np.sum(true_edges)
+    n_pred = np.sum(est_edges)
+
+    #TPR, FDR, Precision
+    TPR = TP / n_true if n_true > 0 else np.nan
+    Precision = TP / n_pred if n_pred > 0 else np.nan
+    FDR = FP / n_pred if n_pred > 0 else np.nan
+
+    # SHD
+    if count_reversed_as_two:
+        SHD = np.sum(A_true != A_est)
+    else:
+        # skeleton: if undirected edge exist
+        S_true = ((A_true + A_true.T) > 0).astype(int)
+        S_est  = ((A_est  + A_est.T)  > 0).astype(int)
+
+        # additions + deletions in skeleton
+        skel_diff = np.sum(np.abs(S_true - S_est)) / 2
+
+        # correct direction or not
+        reversals = 0
+        for i in range(d):
+            for j in range(i+1, d):
+                if S_true[i, j] == 1 and S_est[i, j] == 1:
+                    # true: i->j or j->i
+                    true_ij = A_true[i, j]
+                    true_ji = A_true[j, i]
+                    est_ij  = A_est[i, j]
+                    est_ji  = A_est[j, i]
+
+                    #calculate reversal cases
+                    if true_ij == 1 and true_ji == 0 and est_ij == 0 and est_ji == 1:
+                        reversals += 1
+                    if true_ij == 0 and true_ji == 1 and est_ij == 1 and est_ji == 0:
+                        reversals += 1
+
+        SHD = skel_diff + reversals
+
+    metrics = {
+        'SHD': float(SHD),
+        'TPR': float(TPR) if TPR == TPR else np.nan,  # avoid NaN
+        'FDR': float(FDR) if FDR == FDR else np.nan,
+        'Precision': float(Precision) if Precision == Precision else np.nan,
+        'Runtime': runtime,
+    }
+    return metrics
+
+#this is for evaluating notears results only, as it contains a step of transform graph to adjency graph
+def evaluate_graph_update(
+    A_true,
+    A_est,
+    runtime=None,
+    count_reversed_as_two=False,
+    est_is_weighted=True,
+    thr=0.1,
+    ):
+    A_true = np.asarray(A_true).astype(int)
+    A_est  = np.asarray(A_est).astype(float)
+
+    assert A_true.shape == A_est.shape, "Shapes of A_true and A_est must match."
+    d = A_true.shape[0]
+
+    A_true = A_true.copy()
+    A_est  = A_est.copy()
+    np.fill_diagonal(A_true, 0)
+    np.fill_diagonal(A_est, 0)
+
+    #binary
+    if est_is_weighted:
+        A_est_bin = (np.abs(A_est) > thr).astype(int)
+    else:
+        A_est_bin = (A_est != 0).astype(int)
+
+    #the following is the same as above
+    A_true_bin = (A_true != 0).astype(int)
+
+    true_edges = (A_true_bin == 1)
+    est_edges  = (A_est_bin  == 1)
+
+    TP = np.sum(true_edges & est_edges)
+    FP = np.sum(~true_edges & est_edges)
+    FN = np.sum(true_edges & ~est_edges)
+
+    n_true = np.sum(true_edges)
+    n_pred = np.sum(est_edges)
+
+    TPR = TP / n_true if n_true > 0 else np.nan
+    Precision = TP / n_pred if n_pred > 0 else np.nan
+    FDR = FP / n_pred if n_pred > 0 else np.nan
+
+    if count_reversed_as_two:
+        SHD = np.sum(A_true_bin != A_est_bin)
+    else:
+        S_true = ((A_true_bin + A_true_bin.T) > 0).astype(int)
+        S_est  = ((A_est_bin  + A_est_bin.T)  > 0).astype(int)
+
+        skel_diff = np.sum(np.abs(S_true - S_est)) / 2
+
+        reversals = 0
+        for i in range(d):
+            for j in range(i+1, d):
+                if S_true[i, j] == 1 and S_est[i, j] == 1:
+                    true_ij = A_true_bin[i, j]
+                    true_ji = A_true_bin[j, i]
+                    est_ij  = A_est_bin[i, j]
+                    est_ji  = A_est_bin[j, i]
+
+                    if true_ij == 1 and true_ji == 0 and est_ij == 0 and est_ji == 1:
+                        reversals += 1
+                    if true_ij == 0 and true_ji == 1 and est_ij == 1 and est_ji == 0:
+                        reversals += 1
+
+        SHD = skel_diff + reversals
+
+    metrics = {
+        'SHD': float(SHD),
+        'TPR': float(TPR) if TPR == TPR else np.nan,
+        'FDR': float(FDR) if FDR == FDR else np.nan,
+        'Precision': float(Precision) if Precision == Precision else np.nan,
+        'Runtime': runtime,
+    }
+    return metrics
